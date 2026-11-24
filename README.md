@@ -9,7 +9,7 @@
 ```
 app/
   main.py        FastAPI 应用与进程入口（supervisor / worker 两种模式）
-  supervisor.py  工作进程监管、换版编排（fork+exec、SCM_RIGHTS 传 fd、失败回退）
+  supervisor.py  工作进程监管、换版编排（fork+exec、fd 分批接力中转、容量预检、失败回退）
   worker.py      工作进程：TCP 接入、128B 应用层缓冲、逐行回执、状态快照/恢复
   netutil.py     Unix SEQPACKET 控制通道与 fd 传递（SCM_RIGHTS）
 tests/           端到端集成测试与实测脚本（真实子进程 + 真实 TCP/HTTP）
@@ -57,15 +57,28 @@ nc localhost 9000
 
 ## 换版语义（关键设计）
 
-工作进程与 supervisor 之间用 Unix `SOCK_SEQPACKET` + `SCM_RIGHTS` 传递 fd：
+工作进程与 supervisor 之间用 Unix `SOCK_SEQPACKET` + `SCM_RIGHTS` 传递 fd。
+**快照与 fd 交接分离、fd 分批接力中转**，使监管进程换版期间额外占用的文件
+描述符恒不超过 32，与在线连接总数无关：
 
-1. `SNAPSHOT`：旧工作进程**冻结全部连接 I/O**，停 accept，并把内核中已到达的数据
-   排空到应用层；随后把每个连接的 fd 与应用层缓冲状态（半行 `recv_buf`、
-   未发 `send_buf`、带版号的 `pending` 队列）一并交给 supervisor。
-2. supervisor `fork+exec` 新工作进程，经控制通道转交监听 fd、连接 fd 与缓冲状态；
-   新进程在**同一批 fd** 上原样恢复，回 `READY` 后保持冻结。
-3. 旧进程收 `QUIT` 退出并被回收，supervisor 关闭中转 fd 副本后才发 `GO` 放行新进程，
-   保证任一时刻同一连接只有一个进程在操作。
+1. `SNAPSHOT`：旧工作进程**冻结全部连接 I/O**，停 accept，并把内核中已到达的
+   数据排空到应用层；随后只回传**纯状态**（分块记录，半行 `recv_buf`、
+   未发 `send_buf`、带版号的 `pending` 队列），**不附带任何 fd**——监管进程
+   在快照阶段零连接 fd 占用。
+2. 容量预检：监管进程自身可用 fd 余量至少 32（不足直接 503，**在冻结旧进程
+   之前**拒绝，线上服务不受影响）；新工作进程的 nofile 须容得下
+   “在线连接数 + 16 预留”，不足则 `RESUME` 旧进程并返回 503。
+3. supervisor `fork+exec` 新工作进程，先转交监听 fd；连接 fd 按**每批 31 个**
+   接力中转：令旧进程发一批 → 监管收一个立即转发给新进程并关闭中转副本 →
+   批末收旧进程 `FDS_DONE`、等新进程 `FDS_ACK`（逐批流控，防
+   `ETOOMANYREFS`）后再发下一批。任一时点监管额外持有的 fd 至多为
+   1 个新控制通道 + 31 个连接 fd = **32**。应用缓冲状态随后分块移交，
+   新进程在同一批 fd 上原样恢复，回 `READY` 后保持冻结。
+4. 旧进程收 `QUIT` 退出并被回收，supervisor 关闭中转 fd 副本后才发 `GO`
+   放行新进程，保证任一时刻同一连接只有一个进程在操作。
+5. 任一阶段失败（握手超时、新进程接管前退出、协议错误）：杀掉新进程、
+   关闭全部中转 fd 副本、向旧进程发 `RESUME` 并等 `RESUMED` 确认；存活的
+   旧进程沿原连接按原版立即恢复服务，本轮资源释放干净，可再次换版。
 
 由此满足：
 
@@ -73,7 +86,20 @@ nc localhost 9000
 - 换版时**只有半行**的 → 缓冲随 fd 移交，补齐后按**新版**回执；
 - 探头**停读**或只发半行 → 不阻塞换版，旧进程直接退出，连接由新进程继承，
   探头**无需重连**；其他探头全程照常收回执；
-- 新进程启动/握手失败 → supervisor 回 `RESUME`，旧进程解冻继续按原版服务。
+- 新进程启动/握手失败、交接中断 → supervisor 回 `RESUME`，旧进程解冻继续
+  按原版服务，PID/版号不变，接口返回 503。
+
+### 文件描述符预算与可调项
+
+| 环境变量 | 作用 | 默认 |
+|----------|------|------|
+| `FD_HEADROOM_FLOOR` | 换版要求的监管进程最小可用 fd 余量（也是额外占用上界） | 32 |
+| `SUPERVISOR_NOFILE` | 监管进程启动后压低自身软 nofile（受限环境模拟/调优） | 不设置 |
+| `WORKER_NOFILE_SOFT` | 工作进程握手前把软 nofile 调到该值（不超过 hard） | 不设置 |
+| `WORKER_NOFILE_HARD` | 工作进程启动时先压 hard nofile（模拟容量更小的容器） | 不设置 |
+
+`GET /status` 额外返回 `fd_soft_limit / fd_open / fd_headroom /
+reload_extra_fd_peak`（上一轮换版监管进程额外占用 fd 的高水位），便于观测。
 
 ## 缓冲策略
 
@@ -88,10 +114,16 @@ nc localhost 9000
 ```bash
 pip install -r requirements.txt httpx
 python tests/integration_test.py        # 7 组端到端用例
+python tests/fd_limit_test.py           # 描述符受限 + 交接中断（6 组）
 python tests/manual_reload_demo.py      # 实测：停读/半行换版
 python tests/buffer_cap_test.py         # 128B 上限与连接隔离、回执不丢不重
 python tests/revision_boundary_test.py  # 版号边界
+python tests/stress_test.py             # 多探头 + 并发换版压力
 ```
 
 覆盖：逐行回执/顺序/半行、换版版号语义、停读与半行不阻塞换版、
-新进程失败回退、128B 缓冲隔离、超长/非整数行丢弃、`/docs` 可用、多次换版 PID 轮换。
+新进程失败回退、**在线连接数超过监管余量仍可换版且额外 fd 峰值 ≤ 32**、
+**余量不足在冻结前快速 503（旧连接不冻住）**、**新进程容量不足预检拒绝**、
+**交接中断（新进程接管前中途退出）旧进程原版恢复且可再次换版**、
+**200 连接分批交接无死锁/无 ETOOMANYREFS**、128B 缓冲隔离、
+超长/非整数行丢弃、`/docs` 可用、多次换版 PID 轮换。

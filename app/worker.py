@@ -8,23 +8,29 @@
 3. 完整一行（收到 ``\\n``）生成且只生成一次回执
    ``校正后整数温度,版号\\n``，校正值 = 上报整数 + 当前偏移。
 
-换版语义（与 supervisor 配合）
-------------------------------
-- SNAPSHOT 时工作进程冻结全部连接 I/O，把每个连接的 fd 经 SCM_RIGHTS
-  交出，并序列化应用层缓冲（半行 recv_buf、未发 send_buf、带版号的
-  pending 队列）。新进程凭这些原样恢复，因此：
+换版语义（与 supervisor 配合，有界分批交接）
+---------------------------------------------
+- SNAPSHOT 时工作进程冻结全部连接 I/O，**只回传应用层缓冲状态**
+  （半行 recv_buf、未发 send_buf、带版号的 pending 队列），分块发送、
+  不附带任何 fd，因此监管进程在快照阶段不额外占用连接 fd。
+- 之后旧进程保持冻结，按监管进程的 ``GIVE_FDS`` 指令**分批**经 SCM_RIGHTS
+  交连接 fd（每批 31 个，批末回 ``FDS_DONE``）；连接对象与 fd 始终保留在
+  旧进程中，直到收到 ``QUIT`` 才退出。
+- 收到 ``RESUME``（新进程失败/容量不足/交接中断）：重新注册监听与全部
+  存活连接、解冻 I/O，并回 ``RESUMED`` 确认；沿原连接按原版继续服务。
+  由此满足：
     * 换版前已收到换行符的行，回执保留旧版号；
-    * 只收到半行的，缓冲随 fd 一起交给新进程，补齐后按新版回执；
+    * 只收到半行的，缓冲状态随交接交给新进程，补齐后按新版回执；
     * 探头停读或只发半行都不阻塞换版——旧进程直接退出，
       内核 socket 与应用缓冲分别由 fd 继承和状态移交保留；
     * 探头无需重连，其他探头照常收回执。
-- 新进程 READY 失败时 supervisor 发 RESUME，旧进程解冻，继续按原版接单。
 """
 from __future__ import annotations
 
 import base64
 import os
 import re
+import resource
 import select
 import socket
 import sys
@@ -37,6 +43,9 @@ MAX_LINE_BODY = 32          # 每行至多 32 字节（不含换行符）
 MAX_BUFFER = 128            # 每条连接应用层收/发缓冲各最多 128 字节
 HANDSHAKE_TIMEOUT = 10.0
 FROZEN_VERDICT_DEADLINE = 30.0  # 冻结后等待 supervisor 裁决的总时限
+# 与 supervisor.FD_BATCH / STATE_CHUNK 对应的协议常量
+FD_BATCH = 31
+STATE_CHUNK = 8
 _INT_RE = re.compile(rb"^[+-]?\d+$")
 
 
@@ -51,9 +60,14 @@ class Conn:
     eof: bool = False
     closed: bool = False
 
+    def __post_init__(self) -> None:
+        # 缓存 fd：socket.close() 后 fileno() 会返回 -1，而关闭路径
+        # （_reap/_poll_modify）仍需用稳定的整数 key 操作 poll 与 conns 字典
+        self._fd = self.sock.fileno()
+
     @property
     def fd(self) -> int:
-        return self.sock.fileno()
+        return self._fd
 
     def mask(self) -> int:
         if self.closed:
@@ -152,8 +166,8 @@ class Worker:
         self.control.setblocking(True)
         self.poller.unregister(self.listen_sock.fileno())
 
-        state = {"conns": []}
         live: list[Conn] = []
+        entries: list[dict] = []
         for conn in list(self.conns.values()):
             if conn.closed:
                 continue
@@ -162,7 +176,7 @@ class Worker:
             self._read_conn(conn)
             self._enqueue_lines(conn)
             live.append(conn)
-            state["conns"].append(
+            entries.append(
                 {
                     "recv": base64.b64encode(bytes(conn.recv_buf)).decode(),
                     "send": base64.b64encode(bytes(conn.send_buf)).decode(),
@@ -174,27 +188,56 @@ class Worker:
                     "paused": conn.read_paused,
                 }
             )
-        send_fd(self.control, {"type": "SNAPSHOT_STATE", "n": len(live),
-                               "conns": state["conns"]}, None)
-        for conn in live:  # 顺序与 state["conns"] 一一对应
-            send_fd(self.control, {"type": "FD"}, conn.fd)
-        self._log(f"snapshot sent: {len(live)} live conns")
 
-        # 等待裁决：QUIT（新版就绪，旧版退出）或 RESUME（新进程失败，解冻）。
-        # 短超时循环避免与 supervisor 握手超时竞争；设总时限，
-        # supervisor 异常时旧进程能自我解冻，不会永久冻结停服。
+        # 纯状态分块快照：不附带 fd，监管进程快照阶段不额外占用连接 fd
+        n = len(live)
+        if n == 0:
+            send_fd(
+                self.control,
+                {"type": "SNAPSHOT_STATE", "n": 0, "more": False, "conns": []},
+                None,
+            )
+        else:
+            for i in range(0, n, STATE_CHUNK):
+                part = entries[i : i + STATE_CHUNK]
+                send_fd(
+                    self.control,
+                    {
+                        "type": "SNAPSHOT_STATE",
+                        "n": n,
+                        "more": i + STATE_CHUNK < n,
+                        "conns": part,
+                    },
+                    None,
+                )
+        self._log(f"snapshot state sent: {n} live conns (no fds)")
+
+        # 保持冻结，等待裁决。期间监管进程按批索要 fd；QUIT 表示新版就绪，
+        # RESUME 表示交接失败、解冻恢复。设总时限，supervisor 异常时旧进程
+        # 能自我解冻，不会永久冻结停服。
         self.control.settimeout(5.0)
         deadline = time.monotonic() + FROZEN_VERDICT_DEADLINE
         verdict: dict | None = None
         while verdict is None and time.monotonic() < deadline:
             try:
                 msg, _ = recv_fd(self.control)
+                kind = msg.get("type")
+                if kind in ("QUIT", "RESUME"):
+                    verdict = msg
+                    break
+                if kind == "GIVE_FDS":
+                    self._give_fd_batch(live, msg)
+                else:
+                    self._log(f"frozen loop unknown message: {msg!r}")
             except TimeoutError:
                 continue
             except EOFError:
                 os._exit(0)
-            if msg.get("type") in ("QUIT", "RESUME"):
-                verdict = msg
+            except (OSError, ReloadAbort) as exc:
+                # 控制通道故障/协议区间非法：交接已不可能，直接退出，
+                # supervisor 的 watcher 会同版重拉；不会带着半交接状态服务
+                self._log(f"frozen handover broken: {exc!r}, exit")
+                os._exit(2)
         if verdict is None:
             self._log("verdict timeout, self-resume")
             verdict = {"type": "RESUME"}
@@ -202,13 +245,30 @@ class Worker:
             self._log("superseded by new worker -> exit")
             os._exit(0)
 
-        self.control.setblocking(False)
-        self.frozen = False
+        # RESUME：重新接管监听与全部存活连接，沿原连接按原版恢复服务
         self.poller.register(self.listen_sock.fileno(), select.POLLIN)
         for conn in live:
             if not conn.closed:
                 self.poller.register(conn.fd, conn.mask())
-        self._log("resumed after failed handover")
+        self.frozen = False
+        self.control.setblocking(False)
+        try:
+            send_fd(self.control, {"type": "RESUMED", "conns": len(live)}, None)
+        except OSError:
+            pass
+        self._log(f"resumed after failed handover: {len(live)} conns reattached")
+
+    def _give_fd_batch(self, live: list[Conn], msg: dict) -> None:
+        """按监管进程指定的区间批量交 fd，序号与状态条目顺序一一对应。"""
+        start = int(msg.get("start", -1))
+        count = int(msg.get("count", 0))
+        end = start + count
+        if start < 0 or end > len(live) or count > FD_BATCH:
+            raise ReloadAbort(f"bad GIVE_FDS range: start={start} count={count}")
+        for conn in live[start:end]:
+            send_fd(self.control, {"type": "FD"}, conn.fd)
+        send_fd(self.control, {"type": "FDS_DONE", "start": start,
+                               "count": count}, None)
 
     # ---------------- accept ----------------
     def _on_accept(self) -> None:
@@ -325,9 +385,16 @@ class Worker:
         self._poll_modify(conn)
         return not buf
 
-    # ---------------- 状态快照/恢复 ----------------
-    def load_state(self, state: dict, conn_socks: list[socket.socket]) -> None:
-        for sock, item in zip(conn_socks, state.get("conns", [])):
+    # ---------------- 状态恢复 ----------------
+    def load_state(self, state_chunks: list[dict],
+                   conn_socks: list[socket.socket]) -> None:
+        conns_items: list[dict] = []
+        n_total = int(state_chunks[0].get("n", 0))
+        for chunk in state_chunks:
+            conns_items.extend(chunk.get("conns", []))
+        if n_total != len(conns_items) or len(conns_items) != len(conn_socks):
+            raise ValueError("state/fd count mismatch")
+        for sock, item in zip(conn_socks, conns_items):
             sock.setblocking(False)
             conn = Conn(
                 sock=sock,
@@ -345,9 +412,6 @@ class Worker:
                 raise ValueError("inherited state exceeds buffer cap")
             self.conns[conn.fd] = conn
             self.poller.register(conn.fd, conn.mask())
-
-    def snapshot_fds(self) -> list[int]:
-        return [c.fd for c in self.conns.values() if not c.closed]
 
     # ---------------- 杂项 ----------------
     def _poll_modify(self, conn: Conn) -> None:
@@ -388,15 +452,50 @@ class Worker:
         sys.stderr.flush()
 
 
+class ReloadAbort(RuntimeError):
+    """冻结交接协议出错，旧工作进程退出（由 supervisor 走崩溃恢复）。"""
+
+
 # ---------------- 进程入口（fresh start 与 exec 后共用） ----------------
+def _apply_worker_rlimit() -> None:
+    """按测试/部署环境变量调整工作进程软 nofile。
+
+    - ``WORKER_NOFILE_HARD``：先把 hard 压到该值（须不低于当前 soft，
+      因此需要在工作进程一启动、尚未打开任何 fd 时设置），用于模拟
+      受限容器里工作进程整体 fd 容量更小的场景；
+    - ``WORKER_NOFILE_SOFT``：把 soft 抬/压到该值（不超过 hard）。
+    """
+    hard_target = int(os.environ.get("WORKER_NOFILE_HARD", "0"))
+    if hard_target > 0:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard_target < hard:
+            resource.setrlimit(
+                resource.RLIMIT_NOFILE,
+                (min(soft, hard_target), hard_target),
+            )
+    soft_target = int(os.environ.get("WORKER_NOFILE_SOFT", "0"))
+    if soft_target > 0:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(
+            resource.RLIMIT_NOFILE, (min(soft_target, hard), hard)
+        )
+
+
 def worker_entry() -> None:
-    # 测试用：模拟新工作进程启动失败。必须在任何握手之前退出，
-    # 这样旧工作进程仍冻结在 SNAPSHOT 阶段，supervisor 可安全 RESUME 回退。
+    # 测试用：模拟新工作进程失败。
+    # - WORKER_FAIL_MARKER 文件存在即失败；
+    # - WORKER_FAIL_AFTER_FDS=N（可选）：在收到 N 个连接 fd 之后才退出，
+    #   用于模拟“接管前中途退出”，验证旧进程 RESUME 回退与资源释放。
+    # 必须在任何对外应答之前退出，这样旧工作进程仍安全冻结在交接阶段。
     marker = os.environ.get("WORKER_FAIL_MARKER")
-    if marker and os.path.exists(marker):
+    fail_after = int(os.environ.get("WORKER_FAIL_AFTER_FDS", "0"))
+    fail_now = bool(marker and os.path.exists(marker) and fail_after == 0)
+    if fail_now:
         sys.stderr.write("[worker] boot failure injected\n")
         sys.stderr.flush()
         os._exit(2)
+
+    _apply_worker_rlimit()
 
     control_fd = int(os.environ["WORKER_CONTROL_FD"])
     offset = int(os.environ["WORKER_OFFSET"])
@@ -412,23 +511,53 @@ def worker_entry() -> None:
         os._exit(2)
     n = int(hello.get("conns", 0))
 
+    # 连接 fd 与后续 STATE 分块严格按协议顺序到达。
+    # 每收满 FD_BATCH 个回一个 FDS_ACK，做逐批流控：让 supervisor 确认这批
+    # fd 已被本进程 recvmsg 取走后再发下一批，避免在 unix socket 缓冲里
+    # 积压过多 SCM_RIGHTS 引用触发 ETOOMANYREFS。
     conn_socks: list[socket.socket] = []
-    for _ in range(n):
+    while len(conn_socks) < n:
         msg, fd = recv_fd(control)
         if msg.get("type") != "FD" or fd is None:
             sys.stderr.write("[worker] bad FD record\n")
             os._exit(2)
         conn_socks.append(socket.socket(fileno=fd))
+        if (
+            marker
+            and os.path.exists(marker)
+            and fail_after > 0
+            and len(conn_socks) >= fail_after
+        ):
+            sys.stderr.write(
+                f"[worker] injected failure after {len(conn_socks)} fds\n"
+            )
+            sys.stderr.flush()
+            os._exit(2)
+        if len(conn_socks) % FD_BATCH == 0 or len(conn_socks) == n:
+            send_fd(
+                control,
+                {"type": "FDS_ACK", "count": len(conn_socks)},
+                None,
+            )
 
-    state, _ = recv_fd(control)
-    if state.get("type") != "STATE":
-        sys.stderr.write("[worker] bad STATE record\n")
-        os._exit(2)
+    state_chunks: list[dict] = []
+    while True:
+        chunk, _ = recv_fd(control)
+        if chunk.get("type") != "STATE":
+            sys.stderr.write("[worker] bad STATE record\n")
+            os._exit(2)
+        state_chunks.append(chunk)
+        if not chunk.get("more"):
+            break
 
     listen_sock = socket.socket(fileno=listen_fd)
     listen_sock.setblocking(False)
     worker = Worker(listen_sock, control, offset, revision)
-    worker.load_state(state, conn_socks)
+    try:
+        worker.load_state(state_chunks, conn_socks)
+    except ValueError as exc:
+        sys.stderr.write(f"[worker] load_state failed: {exc!r}\n")
+        os._exit(2)
 
     send_fd(control, {"type": "READY", "pid": os.getpid()}, None)
     go, _ = recv_fd(control)  # supervisor 确认接管后才放行
